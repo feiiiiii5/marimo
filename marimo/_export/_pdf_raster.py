@@ -554,6 +554,16 @@ async def _wait_for_target_ready(
         return True
 
 
+def _output_selector(cell_id: CellId_t) -> str:
+    """Selector for a cell output, including bare Vega/Vega-Lite embeds.
+
+    HTML outputs render inside ``.output``; Vega mimetypes render as a bare
+    ``.vega-embed`` element with no wrapper.
+    """
+    container = f"#output-{cell_id}"
+    return f"{container} > .output, {container} > .vega-embed"
+
+
 async def _capture_pngs_from_page(
     *,
     page_url: str,
@@ -640,7 +650,7 @@ async def _capture_pngs_from_page(
 
             # In live notebook mode, output wrappers often use `display: contents`,
             # which cannot be directly screenshotted, so we target a concrete child node.
-            locator = page.locator(f"#output-{target.cell_id} > .output").first
+            locator = page.locator(_output_selector(target.cell_id)).first
             if not await _wait_for_target_ready(
                 page=page,
                 target=target,
