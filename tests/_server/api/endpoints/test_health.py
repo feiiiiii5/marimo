@@ -1,6 +1,8 @@
 # Copyright 2026 Marimo. All rights reserved.
 from __future__ import annotations
 
+import json
+import subprocess
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -225,6 +227,88 @@ def test_usage_rocm_gpu(client: TestClient) -> None:
     assert memory["used"] == 1069268992
     assert memory["free"] == 8573157376 - 1069268992
     assert memory["percent"] == pytest.approx(1069268992 / 8573157376 * 100)
+
+
+def test_usage_amd_smi_gpu(client: TestClient) -> None:
+    static_output = json.dumps(
+        {
+            "gpu_data": [
+                {
+                    "gpu": 0,
+                    "asic": {"market_name": "AMD Radeon 8060S"},
+                }
+            ]
+        }
+    )
+    metric_output = json.dumps(
+        {
+            "gpu_data": [
+                {
+                    "gpu": 0,
+                    "usage": {"gfx_activity": {"value": 6, "unit": "%"}},
+                    "mem_usage": {
+                        "total_vram": {"value": 2048, "unit": "MB"},
+                        "used_vram": {"value": 738, "unit": "MB"},
+                        "total_gtt": {"value": 28672, "unit": "MB"},
+                        "used_gtt": {"value": 99, "unit": "MB"},
+                    },
+                }
+            ]
+        }
+    )
+
+    def fake_run(
+        cmd: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        output = static_output if cmd[1] == "static" else metric_output
+        return subprocess.CompletedProcess(cmd, 0, stdout=output, stderr="")
+
+    with (
+        patch(
+            "marimo._server.api.endpoints.health._is_gpu_available",
+            return_value="amd",
+        ),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        response = client.get("/api/usage", headers=token_header())
+    assert response.status_code == 200
+    gpu = response.json()["gpu"]
+    assert len(gpu) == 1
+    assert gpu[0]["index"] == 0
+    assert gpu[0]["name"] == "AMD Radeon 8060S"
+    memory = gpu[0]["memory"]
+    total = (2048 + 28672) * 1024 * 1024
+    used = (738 + 99) * 1024 * 1024
+    assert memory["total"] == total
+    assert memory["used"] == used
+    assert memory["free"] == total - used
+    assert memory["percent"] == pytest.approx(used / total * 100)
+
+
+def test_is_gpu_available_amd_smi_fallback() -> None:
+    from marimo._server.api.endpoints import health as health_module
+
+    def fake_which(pkg: str) -> bool:
+        return pkg == "amd-smi"
+
+    def fake_run(
+        cmd: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    with (
+        patch.object(
+            health_module.DependencyManager,
+            "which",
+            side_effect=fake_which,
+        ),
+        patch("subprocess.run", side_effect=fake_run),
+    ):
+        health_module._is_gpu_available.cache_clear()
+        try:
+            assert health_module._is_gpu_available() == "amd"
+        finally:
+            health_module._is_gpu_available.cache_clear()
 
 
 @with_session(SESSION_ID)

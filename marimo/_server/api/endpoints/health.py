@@ -373,6 +373,8 @@ async def usage(request: Request) -> JSONResponse:
         gpu_stats = _parse_nvidia_smi_stats()
     elif gpu_available == "rocm":
         gpu_stats = _parse_rocm_smi_stats()
+    elif gpu_available == "amd":
+        gpu_stats = _parse_amd_smi_stats()
 
     return JSONResponse(
         {
@@ -430,9 +432,13 @@ _AMD_GPU_STATS_CMD = [
     "--json",
 ]
 
+_AMD_SMI_STATIC_CMD = ["amd-smi", "static", "--json"]
+
+_AMD_SMI_METRIC_CMD = ["amd-smi", "metric", "--json"]
+
 
 @lru_cache(maxsize=1)
-def _is_gpu_available() -> Literal["nvidia", "rocm", False]:
+def _is_gpu_available() -> Literal["nvidia", "rocm", "amd", False]:
     import subprocess
 
     if DependencyManager.which("nvidia-smi"):
@@ -459,8 +465,18 @@ def _is_gpu_available() -> Literal["nvidia", "rocm", False]:
         except (subprocess.SubprocessError, FileNotFoundError):
             pass
 
+    if DependencyManager.which("amd-smi"):
+        try:
+            subprocess.run(
+                _AMD_SMI_STATIC_CMD, capture_output=True, check=True
+            )
+            return "amd"
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+
     LOGGER.warning(
-        "Neither nvidia-smi nor rocm-smi succeeded, cannot get GPU stats"
+        "Neither nvidia-smi, rocm-smi nor amd-smi succeeded, "
+        "cannot get GPU stats"
     )
     return False
 
@@ -555,6 +571,66 @@ def _parse_rocm_smi_stats() -> list[dict[str, Any]]:
                     "total": total,
                     "used": used,
                     "free": free,
+                    "percent": (used / total) * 100 if total > 0 else 0,
+                },
+            }
+        )
+    return stats
+
+
+def _parse_amd_smi_stats() -> list[dict[str, Any]]:
+    import json
+    import subprocess
+
+    try:
+        outputs = [
+            subprocess.run(
+                cmd, capture_output=True, text=True, check=True
+            ).stdout
+            for cmd in (_AMD_SMI_STATIC_CMD, _AMD_SMI_METRIC_CMD)
+        ]
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        LOGGER.warning("Failed to extract AMD GPU stats: %s", e)
+        return []
+
+    try:
+        static_data = json.loads(outputs[0])
+        metric_data = json.loads(outputs[1])
+    except json.JSONDecodeError as e:
+        LOGGER.warning("Failed to parse amd-smi JSON: %s", e)
+        return []
+
+    def _value(node: Any) -> int:
+        if isinstance(node, dict):
+            node = node.get("value")
+        try:
+            return int(float(node))
+        except (TypeError, ValueError):
+            return 0
+
+    metrics = {
+        int(entry.get("gpu", index)): entry
+        for index, entry in enumerate(metric_data.get("gpu_data", []))
+    }
+    stats: list[dict[str, Any]] = []
+    for index, entry in enumerate(static_data.get("gpu_data", [])):
+        gpu_index = int(entry.get("gpu", index))
+        metric = metrics.get(gpu_index, {})
+        mem = metric.get("mem_usage", {})
+        # APUs keep most of the memory in GTT, so count both pools.
+        total_mb = _value(mem.get("total_vram")) + _value(mem.get("total_gtt"))
+        used_mb = _value(mem.get("used_vram")) + _value(mem.get("used_gtt"))
+        total = total_mb * 1024 * 1024
+        used = min(used_mb, total_mb) * 1024 * 1024
+        name = (entry.get("asic") or {}).get("market_name", "AMD GPU")
+        stats.append(
+            {
+                "index": gpu_index,
+                "name": name.strip(),
+                "memory": {
+                    "total": total,
+                    "used": used,
+                    "free": total - used,
                     "percent": (used / total) * 100 if total > 0 else 0,
                 },
             }
